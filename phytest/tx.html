@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>VDSP PHY 테스트 송신기</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { position: absolute; image-rendering: pixelated; image-rendering: crisp-edges; }
+  #info { position: fixed; left: 8px; top: 6px; color: #777; font: 12px/1.45 ui-monospace, monospace;
+          white-space: pre; pointer-events: none; }
+  #info .warn { color: #c80; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info"></div>
+<script src="vdsp_frame.js"></script>
+<script>
+'use strict';
+/*
+ * URL 파라미터 (예: tx.html?mode=anim&fps=15)
+ *   mode    static | anim      (기본 static: 한 프레임 고정)
+ *   frame   시작 프레임 번호   (기본 0)
+ *   n       시퀀스 길이, 4의 배수 (기본 64). 분석기의 --n과 같아야 함
+ *   seed    데이터 시드        (기본 1).     분석기의 --seed와 같아야 함
+ *   fps     송출 속도          (기본 15)
+ *   px      셀당 물리 픽셀     (기본 자동: 화면에 들어가는 최대 정수)
+ *   quiet   흑색 여백 셀 수    (기본 4)
+ *   pin     checker | cross    (기본 checker = spec 2.4)
+ *   counter bin | gray         (기본 bin = spec 2.5)
+ *   palette rgbw | cmyg        (기본 rgbw = spec 2.1, cmyg = libcimbar 4색 비교용)
+ *   info    0이면 정보 표시 숨김
+ * 키: Space 재생/정지, ←/→ 한 프레임, F 전체 화면, +/- 셀 크기, 0 자동 크기, H 정보 표시
+ */
+const q = new URLSearchParams(location.search);
+const num = (k, d) => (q.has(k) ? Number(q.get(k)) : d);
+const P = {
+  mode: q.get('mode') || 'static',
+  start: num('frame', 0),
+  n: num('n', 64),
+  seed: num('seed', 1),
+  fps: num('fps', 15),
+  px: num('px', 0),
+  quiet: num('quiet', 4),
+  pin: q.get('pin') || 'checker',
+  counter: q.get('counter') || 'bin',
+  palette: q.get('palette') || 'rgbw',
+  info: q.get('info') !== '0',
+};
+if (P.n % 4 !== 0) P.n = Math.ceil(P.n / 4) * 4; // 카운터가 시퀀스 경계에서 끊기지 않도록
+
+const S = VDSP.S, Q = P.quiet, SIDE = S + 2 * Q;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+const info = document.getElementById('info');
+
+// 프레임을 셀 단위(1셀 = 1px) 오프스크린 캔버스로 미리 만든다
+const layout = VDSP.buildLayout(P.pin);
+const frames = [];
+for (let i = 0; i < P.n; i++) {
+  const cells = VDSP.genFrame(layout, i, { seed: P.seed, counter: P.counter });
+  const img = new ImageData(SIDE, SIDE);
+  const d = img.data;
+  for (let p = 3; p < d.length; p += 4) d[p] = 255; // 여백은 흑색
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const c = (VDSP.PALETTES[P.palette] || VDSP.PALETTE)[cells[y * S + x]];
+      const o = ((y + Q) * SIDE + (x + Q)) * 4;
+      d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2];
+    }
+  }
+  const off = document.createElement('canvas');
+  off.width = off.height = SIDE;
+  off.getContext('2d').putImageData(img, 0, 0);
+  frames.push(off);
+}
+
+let px = 1, dpr = 1, screenPx = [0, 0];
+let cur = ((P.start % P.n) + P.n) % P.n;
+let playing = P.mode === 'anim';
+let t0 = 0, base = cur, shown = -1;
+let rafDeltas = [], lastRaf = 0, vsyncCount = 0, holds = [];
+
+function place() {
+  dpr = window.devicePixelRatio || 1;
+  const Wp = Math.round(innerWidth * dpr), Hp = Math.round(innerHeight * dpr);
+  screenPx = [Wp, Hp];
+  const auto = Math.max(1, Math.floor(Math.min(Wp, Hp) / SIDE));
+  px = P.px > 0 ? P.px : auto;
+  const size = SIDE * px;
+  canvas.width = canvas.height = size;
+  canvas.style.width = canvas.style.height = size / dpr + 'px';
+  // 물리 픽셀 경계에 맞춰 배치
+  canvas.style.left = Math.floor((Wp - size) / 2) / dpr + 'px';
+  canvas.style.top = Math.floor((Hp - size) / 2) / dpr + 'px';
+  shown = -1;
+  draw(cur);
+}
+
+function draw(i) {
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(frames[i], 0, 0, canvas.width, canvas.height);
+  // 재생 중 각 프레임이 몇 번의 화면 갱신(vsync) 동안 유지됐는지 기록 (첫 프레임은 제외)
+  if (playing && shown >= 0 && vsyncCount > 0) { holds.push(vsyncCount); if (holds.length > 60) holds.shift(); }
+  shown = i;
+  vsyncCount = 0;
+}
+
+function median(a) {
+  if (!a.length) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  return s[s.length >> 1];
+}
+
+function updateInfo() {
+  if (!P.info) { info.textContent = ''; return; }
+  const hz = rafDeltas.length ? 1000 / median(rafDeltas) : 0;
+  const hMin = playing && holds.length ? Math.min(...holds) : '-';
+  const hMax = playing && holds.length ? Math.max(...holds) : '-';
+  const warn = [];
+  if (px < 4) warn.push(`셀당 ${px}px: 4px 이상 권장`);
+  if (SIDE * px > Math.min(screenPx[0], screenPx[1])) warn.push('프레임이 화면보다 큼: - 또는 0 키로 줄이세요');
+  if (dpr % 1 !== 0 && P.px > 0) warn.push(`devicePixelRatio ${dpr}: 비정수 배율, 경계 불균일 가능`);
+  if (playing && hMin !== hMax) warn.push(`프레임 유지 시간 불균일 (${hMin}~${hMax} vsync)`);
+  info.innerHTML =
+    `VDSP PHY TX  frame ${shown}/${P.n}  counter ${VDSP.counterValue(shown, P.counter)}  ` +
+    `${playing ? 'anim ' + P.fps + 'fps' : 'static'}\n` +
+    `셀 ${px}px(물리)  dpr ${dpr}  프레임 ${SIDE * px}px  화면 ${screenPx[0]}x${screenPx[1]}\n` +
+    `주사율 ~${hz.toFixed(1)}Hz  유지 ${hMin}~${hMax} vsync  seed ${P.seed}  n ${P.n}  ` +
+    `pin ${P.pin}  counter ${P.counter}  palette ${P.palette}\n` +
+    `Space 재생/정지  ←/→ 이동  F 전체화면  +/- 셀크기  0 자동  H 숨김` +
+    (warn.length ? '\n<span class="warn">' + warn.join('\n') + '</span>' : '');
+}
+
+function tick(now) {
+  if (lastRaf) { rafDeltas.push(now - lastRaf); if (rafDeltas.length > 120) rafDeltas.shift(); }
+  lastRaf = now;
+  vsyncCount++;
+  if (playing) {
+    if (!t0) t0 = now;
+    // 전환 시각이 vsync와 겹치면 오차로 3/5 vsync가 섞이므로 반 vsync 여유를 둔다
+    const half = rafDeltas.length ? median(rafDeltas) / 2 : 8;
+    const f = (base + Math.floor((now - t0 + half) * P.fps / 1000)) % P.n;
+    if (f !== shown) { cur = f; draw(f); }
+  }
+  updateInfo();
+  requestAnimationFrame(tick);
+}
+
+function setPlaying(on) {
+  playing = on;
+  base = cur; t0 = 0; holds = [];
+}
+
+addEventListener('keydown', (e) => {
+  const k = e.key;
+  if (k === ' ') setPlaying(!playing);
+  else if (k === 'ArrowRight' || k === 'ArrowLeft') {
+    setPlaying(false);
+    cur = (cur + (k === 'ArrowRight' ? 1 : P.n - 1)) % P.n;
+    draw(cur);
+  } else if (k === 'f' || k === 'F') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  } else if (k === '+' || k === '=') { P.px = px + 1; place(); }
+  else if (k === '-') { P.px = Math.max(1, px - 1); place(); }
+  else if (k === '0') { P.px = 0; place(); }
+  else if (k === 'h' || k === 'H') { P.info = !P.info; }
+  else return;
+  e.preventDefault();
+});
+addEventListener('resize', place);
+
+place();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

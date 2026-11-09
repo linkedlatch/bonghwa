@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+phy_result*/
+*.mp4
+*.mov
+media/
+.pylib/
+*.MOV
